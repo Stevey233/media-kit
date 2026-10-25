@@ -13,6 +13,7 @@ import 'package:synchronized/synchronized.dart';
 import 'package:media_kit/media_kit.dart';
 
 import 'package:media_kit_video/src/video_controller/platform_video_controller.dart';
+import 'output_size.dart';
 
 /// {@template ohos_video_controller}
 ///
@@ -28,6 +29,10 @@ class OhosVideoController extends PlatformVideoController {
 
   /// Pointer address to the global object reference of `OHNativeWindow`.
   final ValueNotifier<int?> wid = ValueNotifier<int?>(null);
+
+  int? _requestedWidth;
+  int? _requestedHeight;
+  VideoParams? _videoParams;
 
   /// [Lock] used to synchronize [onLoadHooks], [onUnloadHooks] & [subscription].
   final lock = Lock();
@@ -48,54 +53,11 @@ class OhosVideoController extends PlatformVideoController {
   StreamSubscription<VideoParams>? videoParamsSubscription;
 
   /// {@macro ohos_video_controller}
-  OhosVideoController._(
-    super.player,
-    super.configuration,
-  ) {
+  OhosVideoController._(super.player, super.configuration) {
     videoParamsSubscription = player.stream.videoParams.listen(
       (event) => lock.synchronized(() async {
-        final int width;
-        final int height;
-        if (event.rotate == 0 || event.rotate == 180) {
-          width = event.dw ?? 0;
-          height = event.dh ?? 0;
-        } else {
-          // width & height are swapped for 90 or 270 degrees rotation.
-          width = event.dh ?? 0;
-          height = event.dw ?? 0;
-        }
-
-        final isZero = width == 0 || height == 0;
-        final isSame = width == rect.value?.width.toInt() &&
-            height == rect.value?.height.toInt();
-        if (isZero || isSame) {
-          return;
-        }
-
-        final handle = await player.handle;
-
-        await _channel.invokeMethod(
-          'VideoOutputManager.SetSurfaceSize',
-          {
-            'handle': handle.toString(),
-            'width': width.toString(),
-            'height': height.toString(),
-          },
-        );
-        await setProperties({
-          'ohos-surface-size': [width, height].join('x'),
-        });
-
-        rect.value = Rect.fromLTWH(
-          0.0,
-          0.0,
-          width.toDouble(),
-          height.toDouble(),
-        );
-
-        if (!waitUntilFirstFrameRenderedCompleter.isCompleted) {
-          waitUntilFirstFrameRenderedCompleter.complete();
-        }
+        _videoParams = event;
+        await _applySize();
       }),
     );
   }
@@ -133,10 +95,7 @@ class OhosVideoController extends PlatformVideoController {
     }
 
     // Creation:
-    final controller = OhosVideoController._(
-      player,
-      configuration,
-    );
+    final controller = OhosVideoController._(player, configuration);
 
     // Register [_dispose] for execution upon [Player.dispose].
     player.platform?.release.add(controller._dispose);
@@ -146,9 +105,7 @@ class OhosVideoController extends PlatformVideoController {
 
     final Map<dynamic, dynamic>? data = await _channel.invokeMethod(
       'VideoOutputManager.Create',
-      {
-        'handle': handle.toString(),
-      },
+      {'handle': handle.toString()},
     );
 
     if (data == null) {
@@ -172,18 +129,16 @@ class OhosVideoController extends PlatformVideoController {
       // MPV's HarmonyOS video output requires a valid surface ID before the
       // GPU video output is initialized.
       await controller.setProperty('vo', 'null');
-      await controller.setProperties(
-        {
-          'ohos-surface-size': '${rect.width.toInt()}x${rect.height.toInt()}',
-          'wid': wid.toString(),
-          'hwdec': configuration.hwdec!,
-          'vid': 'auto',
-          'force-window': 'yes',
-          'sub-use-margins': 'no',
-          'sub-scale-with-window': 'no',
-          'osd-font': 'HarmonyOS Sans SC',
-        },
-      );
+      await controller.setProperties({
+        'ohos-surface-size': '${rect.width.toInt()}x${rect.height.toInt()}',
+        'wid': wid.toString(),
+        'hwdec': configuration.hwdec!,
+        'vid': 'auto',
+        'force-window': 'yes',
+        'sub-use-margins': 'no',
+        'sub-scale-with-window': 'no',
+        'osd-font': 'HarmonyOS Sans SC',
+      });
       await controller.setProperty('vo', configuration.vo!);
     });
 
@@ -191,20 +146,45 @@ class OhosVideoController extends PlatformVideoController {
     return controller;
   }
 
-  /// Sets the required size of the video output.
-  /// This may yield substantial performance improvements if a small [width] & [height] is specified.
-  ///
-  /// Remember:
-  /// * “Premature optimization is the root of all evil”
-  /// * “With great power comes great responsibility”
+  /// Fits the video inside the requested output box.
+  /// Both null dimensions restore the video's display size.
   @override
-  Future<void> setSize({
-    int? width,
-    int? height,
-  }) {
-    throw UnsupportedError(
-      '[OhosVideoController.setSize] is not available on Ohos',
+  Future<void> setSize({int? width, int? height}) =>
+      lock.synchronized(() async {
+        _requestedWidth = width;
+        _requestedHeight = height;
+        await _applySize();
+      });
+
+  // The caller holds lock for both explicit requests and video parameter events.
+  Future<void> _applySize() async {
+    final params = _videoParams ?? player.state.videoParams;
+    final size = ohosOutputSize(
+      displayWidth: params.dw ?? 0,
+      displayHeight: params.dh ?? 0,
+      rotation: params.rotate ?? 0,
+      width: _requestedWidth,
+      height: _requestedHeight,
     );
+    if (size == null) {
+      return;
+    }
+    final (width, height) = size;
+    if (width == rect.value?.width.toInt() &&
+        height == rect.value?.height.toInt()) {
+      return;
+    }
+    final handle = await player.handle;
+    await _channel.invokeMethod('VideoOutputManager.SetSurfaceSize', {
+      'handle': handle.toString(),
+      'width': width.toString(),
+      'height': height.toString(),
+    });
+    await setProperty('ohos-surface-size', '${width}x$height');
+    rect.value = Rect.fromLTWH(0, 0, width.toDouble(), height.toDouble());
+    if (!waitUntilFirstFrameRenderedCompleter.isCompleted) {
+      waitUntilFirstFrameRenderedCompleter.complete();
+    }
   }
 
   /// Disposes the instance. Releases allocated resources back to the system.
@@ -212,12 +192,9 @@ class OhosVideoController extends PlatformVideoController {
     await videoParamsSubscription?.cancel();
     final handle = await player.handle;
     _controllers.remove(handle);
-    await _channel.invokeMethod(
-      'VideoOutputManager.Dispose',
-      {
-        'handle': handle.toString(),
-      },
-    );
+    await _channel.invokeMethod('VideoOutputManager.Dispose', {
+      'handle': handle.toString(),
+    });
     wid.dispose();
     super.dispose();
   }
